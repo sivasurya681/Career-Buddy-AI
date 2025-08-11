@@ -1,0 +1,580 @@
+# data preparation.py
+
+import pandas as pd
+import spacy
+
+def preprocess_text(text, nlp):
+    """Tokenize, lemmatize, and remove punctuation."""
+    if not isinstance(text, str):
+        return ""
+    doc = nlp(text.lower())
+    tokens = [token.lemma_ for token in doc if not token.is_punct and not token.is_space]
+    return " ".join(tokens)
+
+def standardize_column(text, mapping):
+    """Replace text based on a mapping dictionary."""
+    if not isinstance(text, str):
+        return ""
+    return mapping.get(text.lower().strip(), text.lower().strip())
+
+def main():
+    print("Starting data preparation...")
+    
+    # Load dataset
+    dataset_path = "F:\\Intern Project\\Final Code\\dataset_clean.csv"  # Update path
+    print(f"Loading dataset from '{dataset_path}'...")
+    df = pd.read_csv(dataset_path)
+    print(f"✅ Dataset loaded with {len(df)} rows.")
+
+    # Print available columns
+    print("🔍 Available columns:", df.columns.tolist())
+
+    # Remove duplicates
+    print("Removing duplicates...")
+    df.drop_duplicates(inplace=True)
+    print(f"✅ Rows after duplicate removal: {len(df)}")
+
+    # Handle missing columns
+    required_columns = ["Qualifications", "Salary Range", "Job Title", "Role", "Job Description", "Skills", "Company"]
+    existing_columns = [col for col in required_columns if col in df.columns]
+
+    if "Skills" not in df.columns:
+        print("⚠ Warning: 'Skills' column not found. Checking for alternatives...")
+        possible_alternatives = ["Skill", "Skill Set", "Technical Skills"]
+        for alt in possible_alternatives:
+            if alt in df.columns:
+                print(f"✅ Found alternative column: {alt} → Renaming to 'Skills'")
+                df.rename(columns={alt: "Skills"}, inplace=True)
+                existing_columns.append("Skills")
+                break
+
+    if existing_columns:
+        print(f"Dropping rows with missing values in columns: {existing_columns}")
+        df.dropna(subset=existing_columns, inplace=True)
+        print(f"✅ Rows after dropping missing values: {len(df)}")
+    else:
+        print("⚠ No matching columns found to drop NaN values!")
+
+    # Convert text columns to lowercase
+    print("Converting key columns to lowercase...")
+    for col in ["Qualifications", "Job Title", "Role", "Job Description", "Skills", "Company"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.lower()
+
+    # Initialize spaCy
+    print("Loading spaCy model...")
+    nlp = spacy.load("en_core_web_sm")
+
+    # Tokenization & Lemmatization
+    print("Tokenizing and lemmatizing 'Job Description' column...")
+    if "Job Description" in df.columns:
+        df["Job Description"] = df["Job Description"].apply(lambda x: preprocess_text(x, nlp))
+
+    # Save cleaned dataset
+    output_file = "dataset_clean.csv"
+    df.to_csv(output_file, index=False)
+    print(f"✅ Data preparation complete. Cleaned dataset saved as '{output_file}'.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+# prediction.py
+
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LogisticRegression
+import joblib
+import requests
+from bs4 import BeautifulSoup
+
+MODEL_FILENAME = "model.joblib"
+
+
+def train_model():
+    if os.path.exists("dataset_clean.csv"):
+        df = pd.read_csv("dataset_clean.csv")
+    else:
+        df = pd.read_csv("dataset.csv")
+    
+    if "role" in df.columns and "skills" in df.columns:
+        df["text_features"] = df["role"].fillna('') + " " + df["skills"].fillna('')
+    else:
+        raise KeyError("Dataset must contain 'role' and 'skills' columns.")
+    
+    X = df["text_features"]
+    y = df["job title"]
+    
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    pipeline = make_pipeline(
+        TfidfVectorizer(),
+        LogisticRegression(max_iter=1000)
+    )
+    
+    pipeline.fit(X_train, y_train)
+    joblib.dump(pipeline, MODEL_FILENAME)
+    print(f"Model trained and saved as '{MODEL_FILENAME}'.")
+
+
+def predict_job_titles(input_text, top_n=3):
+    pipeline = joblib.load(MODEL_FILENAME)
+    probs = pipeline.predict_proba([input_text])[0]
+    job_titles = pipeline.classes_
+    job_prob_pairs = sorted(zip(job_titles, probs), key=lambda x: x[1], reverse=True)
+    return job_prob_pairs[:top_n]
+
+
+def get_linkedin_job_links(job_title, num_links=5):
+    search_url = f"https://www.linkedin.com/jobs/search?keywords={job_title.replace(' ', '%20')}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+    }
+    
+    response = requests.get(search_url, headers=headers)
+    if response.status_code != 200:
+        return []
+    
+    soup = BeautifulSoup(response.text, "html.parser")
+    job_links = []
+    
+    for job in soup.find_all("a", class_="base-card__full-link", href=True):
+        job_links.append(job["href"])
+        if len(job_links) >= num_links:
+            break
+    
+    return job_links
+
+
+if __name__ == "__main__":
+    train_model()
+
+
+# chatbot.py
+
+import requests
+import os
+from flet import Markdown
+
+GEMINI_API_KEY = "AIzaSyCvMakRfm6bcYebvZ1MHIcqX5soVb9RpTY"
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
+
+ALLOWED_TOPICS = {
+    "career", "job", "role", "certificate", "certification", "resume", "cv",
+    "interview", "salary", "skills", "learning", "courses", "education", "hiring",
+    "recruitment", "linkedin", "udemy", "coursera"
+}
+
+def is_valid_query(user_input):
+    user_input_lower = user_input.lower()
+    return any(topic in user_input_lower for topic in ALLOWED_TOPICS)
+
+def get_gemini_response(prompt):
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    try:
+        response = requests.post(GEMINI_ENDPOINT, headers=headers, params=params, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if "candidates" in data and data["candidates"]:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            return "I'm sorry, but I couldn't generate a response at the moment."
+    except requests.exceptions.RequestException as e:
+        return f"Request error: {e}"
+    except (ValueError, KeyError, IndexError) as e:
+        return f"Error parsing response: {e}"
+
+def get_chatbot_response(query):
+    if not is_valid_query(query):
+        return [Markdown("I'm only able to answer career-related questions.")]
+
+    answer = get_gemini_response(query)
+    lines = answer.split('\n')
+    widgets = []
+    for line in lines:
+        line = line.strip()
+        if line.startswith("- ") or line.startswith("•"):
+            widgets.append(Markdown(f"• {line[2:].strip()}"))
+        elif line.strip():
+            if line.endswith(":"):
+                widgets.append(Markdown(f"## {line}"))  # Use Markdown syntax for headers
+            else:
+                widgets.append(Markdown(line))
+    return widgets
+
+if __name__ == "__main__":
+    print("Career Chatbot (Type 'exit' to quit)")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in {"exit", "quit"}:
+            print("Exiting Chatbot. Goodbye!")
+            break
+        responses = get_chatbot_response(user_input)
+        for r in responses:
+            print("•", r.value)
+
+
+
+# resume_parser.y
+
+import os
+import requests
+import PyPDF2
+from bs4 import BeautifulSoup
+
+# API Key and Endpoint for Gemini
+GEMINI_API_KEY = "AIzaSyCvMakRfm6bcYebvZ1MHIcqX5soVb9RpTY"
+GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+# Function to extract text from a PDF
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    with open(pdf_path, "rb") as pdf_file:
+        reader = PyPDF2.PdfReader(pdf_file)
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text.strip()
+
+# Function to extract skills using Gemini API
+def extract_skills_with_gemini(resume_text):
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": f"""
+                        Extract only skills from this resume text:
+
+                        {resume_text}
+
+                        Return a clean list, separated by commas (e.g., Python, Java, Teamwork).
+                        """
+                    }
+                ]
+            }
+        ]
+    }
+    
+    response = requests.post(GEMINI_ENDPOINT, headers=headers, json=data)
+    
+    if response.status_code == 200:
+        response_json = response.json()
+        return response_json["candidates"][0]["content"]["parts"][0]["text"]
+    else:
+        return f"Error: {response.status_code}, {response.text}"
+
+# Function to fetch a single best-matching job link from LinkedIn
+def get_best_linkedin_job(skill):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    linkedin_url = f"https://www.linkedin.com/jobs/search?keywords={skill.replace(' ', '%20')}"
+    
+    response = requests.get(linkedin_url, headers=headers)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, "html.parser")
+        job_listing = soup.find("a", class_="base-card__full-link", href=True)
+        if job_listing:
+            return job_listing["href"]
+    return "No matching job found."
+
+# Main function for resume parsing
+def parse_resume(pdf_path):
+    if not os.path.exists(pdf_path):
+        return {"error": "File not found"}
+    
+    resume_text = extract_text_from_pdf(pdf_path)
+    extracted_skills = extract_skills_with_gemini(resume_text)
+    
+    matched_jobs = {}
+    for skill in extracted_skills.split(","):
+        job_link = get_best_linkedin_job(skill.strip())
+        matched_jobs[skill.strip()] = job_link
+    
+    return {"extracted_skills": extracted_skills, "matched_jobs": matched_jobs}
+
+if __name__ == "__main__":
+    sample_pdf = "F:\Vaalka nadagama\sample_resume.pdf"  # Replace with an actual file path
+    print(parse_resume(sample_pdf))
+
+
+#ui_design.py
+
+
+import flet as ft
+import prediction
+import resume_parser
+import chatbot
+import pandas as pd
+import os
+import webbrowser
+
+# Load dataset
+if not os.path.exists("dataset_clean.csv"):
+    print("Error: dataset_clean.csv not found!")
+    df = None
+else:
+    df = pd.read_csv("dataset_clean.csv")
+    df.columns = df.columns.str.lower()
+
+# Helper to open URL
+def open_url(url):
+    return lambda e: webbrowser.open(url)
+
+def fallback_linkedin_jobs(skill_text, num_links=5):
+    return prediction.get_linkedin_job_links(skill_text, num_links=num_links)
+
+recent_searches = []
+
+def add_recent_search(query):
+    if query not in recent_searches:
+        recent_searches.append(query)
+        if len(recent_searches) > 5:
+            recent_searches.pop(0)
+
+def get_skill_suggestions(query):
+    query = query.lower()
+    return [s for s in skill_suggestions if query in s.lower()][:5]
+
+def main(page: ft.Page):
+    page.title = "CareerBuddy - AI"
+    page.scroll = ft.ScrollMode.ALWAYS
+    page.theme_mode = "light"
+
+    def get_text_color():
+        return ft.Colors.BLACK if page.theme_mode == "light" else ft.Colors.WHITE
+
+    def update_all_text_colors():
+        text_elements = [
+            header_title, prediction_result_text,
+            skills_field, role_field, chatbot_field, job_heading,
+            chatbot_heading, resume_heading, banner_text
+        ]
+        for element in text_elements:
+            element.color = get_text_color()
+        skills_field.text_style = ft.TextStyle(color=get_text_color())
+        role_field.text_style = ft.TextStyle(color=get_text_color())
+        chatbot_field.text_style = ft.TextStyle(color=get_text_color())
+
+    def toggle_theme(e):
+        page.theme_mode = "dark" if page.theme_mode == "light" else "light"
+        update_all_text_colors()
+        page.update()
+
+    def show_tab(index):
+        for i, content in enumerate(tab_contents):
+            content.visible = i == index
+        page.update()
+
+    theme_switch = ft.Switch(label="🌙", value=False, on_change=toggle_theme)
+    header_title = ft.Text("🚀 Empowering your career journey with AI!", size=18, italic=True, color=get_text_color())
+    header = ft.Row([header_title, theme_switch], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+
+    banner_text = ft.Text("💼 CareerBuddy - AI", size=30, weight="bold", expand=True, color=get_text_color())
+    banner = ft.Container(banner_text, alignment=ft.alignment.center, padding=10)
+
+    global skills_field, skill_suggestions, suggestion_list
+    skill_suggestions = ["Python", "Data Science", "Machine Learning", "Deep Learning", "JavaScript", "SQL", "Java", "HTML", "CSS", "Node.js"]
+    suggestion_list = ft.Column(visible=False, spacing=0)
+
+    def select_suggestion(skill):
+        skills_field.value = skill
+        suggestion_list.visible = False
+        page.update()
+
+    def update_suggestion_list():
+        typed = skills_field.value.strip().lower()
+        matches = get_skill_suggestions(typed)
+        suggestion_list.controls.clear()
+        if typed and matches:
+            for skill in matches:
+                suggestion_list.controls.append(
+                    ft.TextButton(
+                        text=skill,
+                        on_click=lambda e, s=skill: select_suggestion(s),
+                        style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=20), color=get_text_color())
+                    )
+                )
+            suggestion_list.visible = True
+        else:
+            suggestion_list.visible = False
+        page.update()
+
+    skills_field = ft.TextField(label="Enter your skills", width=350, on_change=lambda e: update_suggestion_list(), autofocus=True, color=get_text_color(), text_style=ft.TextStyle(color=get_text_color()))
+    role_field = ft.TextField(label="Enter job role (optional)", width=350, color=get_text_color(), text_style=ft.TextStyle(color=get_text_color()))
+
+    prediction_result_text = ft.Text(color=get_text_color())
+    prediction_result_container = ft.Column()
+    prediction_loader = ft.Row([ft.ProgressRing(), ft.Text("Predicting job titles...", size=14)], visible=False, alignment=ft.MainAxisAlignment.CENTER)
+
+    def predict_click(e):
+        skills = skills_field.value
+        role = role_field.value
+        if not skills:
+            prediction_result_text.value = "Error: Skills are mandatory"
+            page.update()
+            return
+
+        prediction_loader.visible = True
+        prediction_result_text.value = ""
+        prediction_result_container.controls.clear()
+        page.update()
+
+        input_text = (role + " " if role else "") + skills
+        preds = prediction.predict_job_titles(input_text)
+
+        prediction_loader.visible = False
+        prediction_result_container.controls.clear()
+
+        if not preds or preds[0][1] < 0.2:
+            prediction_result_text.value = "Skill match not found. But here are jobs from LinkedIn!"
+            fallback_links = fallback_linkedin_jobs(input_text)
+            for i, link in enumerate(fallback_links):
+                prediction_result_container.controls.append(
+                    ft.ElevatedButton(
+                        text=f"🔗 Apply for '{input_text.strip().title()}' on LinkedIn #{i+1}",
+                        on_click=open_url(link),
+                        style=ft.ButtonStyle(bgcolor=ft.Colors.YELLOW)
+                    )
+                )
+        else:
+            for title, prob in preds:
+                title_lower = title.lower()
+                companies = df[df["job title"].str.lower().str.contains(title_lower, na=False)]["company"].drop_duplicates().tolist() if df is not None else []
+                linkedin_links = prediction.get_linkedin_job_links(title, num_links=1)
+                job_link_button = ft.ElevatedButton(
+                    text=f"🔗 Apply for {title} on LinkedIn",
+                    on_click=open_url(linkedin_links[0]),
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN)
+                ) if linkedin_links else None
+
+                block = [
+                    ft.Text(f"{title} (Confidence: {prob:.2f})", size=18, color=get_text_color(), weight="bold"),
+                    ft.Text(f"Companies: {', '.join(companies[:5])}", color=get_text_color())
+                ]
+                if job_link_button:
+                    block.append(job_link_button)
+
+                prediction_result_container.controls.append(
+                    ft.Card(content=ft.Container(ft.Column(block), padding=10), elevation=5)
+                )
+        page.update()
+
+    # Elevated Button for prediction
+    predict_button = ft.ElevatedButton("🔍 Predict Job Titles", on_click=predict_click, style=ft.ButtonStyle(bgcolor=ft.Colors.ORANGE))
+    # Handle Enter key press for prediction
+    skills_field.on_submit = predict_click
+
+    job_heading = ft.Text("🧠 Job Prediction", size=20, weight="bold", color=get_text_color())
+    job_tab = ft.Column([ft.Container(job_heading, alignment=ft.alignment.center),
+                         ft.Container(ft.Row([skills_field, role_field], alignment=ft.MainAxisAlignment.CENTER, spacing=20)),
+                         ft.Container(suggestion_list, padding=ft.padding.only(left=30)),
+                         ft.Container(ft.Row([predict_button], alignment=ft.MainAxisAlignment.CENTER)),
+                         prediction_loader,
+                         prediction_result_text,
+                         prediction_result_container
+                         ], spacing=15, visible=True)
+
+    # === Chatbot ===
+    chatbot_field = ft.TextField(label="Ask your career question", width=350, color=get_text_color(), text_style=ft.TextStyle(color=get_text_color()))
+    chatbot_result_column = ft.Column(spacing=5, scroll=ft.ScrollMode.ADAPTIVE)
+    chatbot_loader = ft.Row([ft.ProgressRing(), ft.Text("Chatbot is processing...", size=14)], visible=False, alignment=ft.MainAxisAlignment.CENTER)
+
+    def chatbot_click(e):
+        query = chatbot_field.value
+        if not query:
+            chatbot_result_column.controls.clear()
+            chatbot_result_column.controls.append(ft.Text("Error: Please enter a query", size=16, color=ft.Colors.RED))
+            page.update()
+            return
+
+        chatbot_loader.visible = True
+        chatbot_result_column.controls.clear()
+        page.update()
+
+        responses = chatbot.get_chatbot_response(query)
+        chatbot_loader.visible = False
+        chatbot_result_column.controls.extend(responses)
+        page.update()
+
+    # Elevated Button for chatbot
+    chatbot_button = ft.ElevatedButton("💬 Ask Chatbot", on_click=chatbot_click, style=ft.ButtonStyle(bgcolor=ft.Colors.ORANGE))
+    # Handle Enter key press for chatbot
+    chatbot_field.on_submit = chatbot_click
+
+    chatbot_heading = ft.Text("🤖 Career Chatbot", size=20, weight="bold", color=get_text_color())
+    chatbot_tab = ft.Column([ft.Container(chatbot_heading, alignment=ft.alignment.center),
+                             ft.Container(ft.Row([chatbot_field], alignment=ft.MainAxisAlignment.CENTER)),
+                             ft.Container(ft.Row([chatbot_button], alignment=ft.MainAxisAlignment.CENTER)),
+                             chatbot_loader,
+                             chatbot_result_column
+                             ], spacing=15, visible=False)
+
+    # === Resume Analysis ===
+    resume_result_container = ft.Column()
+    resume_loader = ft.Row([ft.ProgressRing(), ft.Text("Parsing resume...", size=14)], visible=False, alignment=ft.MainAxisAlignment.CENTER)
+
+    def resume_picker_result(e: ft.FilePickerResultEvent):
+        if e.files:
+            file_path = e.files[0].path
+            resume_loader.visible = True
+            resume_result_container.controls.clear()
+            page.update()
+
+            resume_info = resume_parser.parse_resume(file_path)
+            resume_loader.visible = False
+
+            extracted_skills = resume_info.get("extracted_skills", "").split(",")
+            matched_jobs = resume_info.get("matched_jobs", {})
+
+            if extracted_skills:
+                resume_result_container.controls.append(ft.Text("Extracted Skills:", size=16, weight="bold", color=get_text_color()))
+                for skill in extracted_skills[:5]:
+                    resume_result_container.controls.append(ft.Text(f"🔹 {skill.strip()}", color=get_text_color()))
+                resume_result_container.controls.append(ft.Text("\nSuggested Jobs:", size=16, weight="bold", color=get_text_color()))
+                for skill, link in matched_jobs.items():
+                    resume_result_container.controls.append(ft.ElevatedButton(text=f"{skill} - LinkedIn Job", on_click=open_url(link)))
+            else:
+                resume_result_container.controls.append(ft.Text("No skills found.", color=get_text_color()))
+        else:
+            resume_result_container.controls.append(ft.Text("No file selected.", color=get_text_color()))
+        page.update()
+
+    file_picker = ft.FilePicker(on_result=resume_picker_result)
+    page.overlay.append(file_picker)
+
+    upload_resume_button = ft.ElevatedButton("📄 Upload Resume", on_click=lambda e: file_picker.pick_files(), style=ft.ButtonStyle(bgcolor=ft.Colors.ORANGE))
+    resume_heading = ft.Text("📎 Resume Analysis", size=20, weight="bold", color=get_text_color())
+    resume_tab = ft.Column([ft.Container(resume_heading, alignment=ft.alignment.center),
+                            ft.Container(ft.Row([upload_resume_button], alignment=ft.MainAxisAlignment.CENTER)),
+                            resume_loader,
+                            resume_result_container
+                            ], spacing=15, visible=False)
+
+    # === Tabs & Footer ===
+    tab_contents = [job_tab, chatbot_tab, resume_tab]
+    bottom_app_bar = ft.BottomAppBar(
+        content=ft.Column([ft.Row([ft.TextButton("🧠 Job Prediction", on_click=lambda e: show_tab(0)),
+                                  ft.TextButton("🤖 Chatbot", on_click=lambda e: show_tab(1)),
+                                  ft.TextButton("📎 Resume Analysis", on_click=lambda e: show_tab(2))
+                                  ], alignment=ft.MainAxisAlignment.CENTER, spacing=20),
+                            ft.Divider(),
+                            ft.Row([ft.Text("© 2025 CareerBuddy - AI | Connect: ", color=ft.Colors.GREY),
+                                    ft.TextButton("LinkedIn", on_click=open_url("https://www.linkedin.com")),
+                                    ft.TextButton("GitHub", on_click=open_url("https://www.github.com"))
+                                    ], alignment=ft.MainAxisAlignment.CENTER)
+                            ])
+    )
+
+    page.bottom_appbar = bottom_app_bar
+    page.add(ft.Column([banner, header] + tab_contents, spacing=25, scroll=ft.ScrollMode.ALWAYS))
+
+ft.app(target=main)
